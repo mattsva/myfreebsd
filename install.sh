@@ -1,17 +1,84 @@
 #!/bin/sh
 #
-# Run as: sudo sh install.sh [username]
+# FreeBSD Hyprland desktop installer — full run
+# Run as: sudo sh install.sh [fast|full] [username]
+#
+# Picks up exactly where stage 1 left off (base FreeBSD 15.x, ZFS/GELI,
+# a user created and in wheel/sudo). From there this single script:
+#
+#   1. builds the Hyprland desktop stack (compositor, bar, terminal,
+#      toolchain, CLI tools, login manager) — mode-dependent, see below
+#   2. writes dotfiles and wires up services/groups
+#   3. hardens pf (aborts if the firewall config is broken)
+#   4. installs the rest of the software stack via pkg, checking what's
+#      already there and continuing past anything that fails
+#
+# TWO MODES, chosen interactively or as $1:
+#   fast  pkg (binary packages) for the desktop stack — only Hyprland,
+#         Hyprlock and Hypridle are actually compiled from ports, because
+#         those move fast upstream and build options matter; everything
+#         else (Mesa, Rust, Go, Firefox, Qt-heavy stuff...) is identical
+#         either way and pkg saves hours. Realistically ~30-60 min.
+#   full  compile the ENTIRE desktop stack from ports, as before.
+#         Realistically an overnight build even on fast hardware.
+#
+# Part B (the big application list: Blender, LibreOffice, Chromium, ...)
+# always uses pkg regardless of mode — compiling that from ports is not
+# a reasonable trade-off in either mode.
+#
+# Rule enforced throughout:
+#   security component fails (pf)      -> ABORT, fix it before continuing
+#   optional application fails         -> log it, move on
+#
+# Logging: every run gets its own timestamped transcript under
+# /var/log/installer/, plus one log file per port build / pkg install so
+# you can find exactly what went wrong without re-running anything.
+#
+# Re-running is safe/idempotent — `make install clean` and `pkg install`
+# both skip what's already there.
 
 set -u
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "Run this as root: sudo sh install.sh [username]" >&2
+    echo "Run this as root: sudo sh install.sh [fast|full] [username]" >&2
     exit 1
 fi
 
-### 0. who is the primary user? ------------------------------------------
-# asked explicitly rather than guessed — $USER/$SUDO_USER can be wrong
-# or empty depending on how sudo was invoked
+LOGDIR=/var/log/installer
+mkdir -p "$LOGDIR"
+MAINLOG="$LOGDIR/install-$(date +%Y%m%d-%H%M%S).log"
+: > "$MAINLOG"
+SCRIPT_START=$(date +%s)
+FAILED=""
+NOTES=""
+
+log()  { printf '[%s] >>> %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$MAINLOG"; }
+warn() { printf '[%s] !!! %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$MAINLOG" >&2; }
+fail() { printf '[%s] XXX %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$MAINLOG" >&2; exit 1; }
+note() { NOTES="$NOTES
+- $*"; }
+
+log "log transcript: $MAINLOG"
+
+### 0. mode + primary user ------------------------------------------------
+
+MODE=""
+case "${1:-}" in
+    fast|full) MODE="$1"; shift ;;
+esac
+
+if [ -z "$MODE" ]; then
+    echo "Choose install mode:"
+    echo "  [1] fast — pkg for the desktop stack, ports only for Hyprland/Hyprlock/Hypridle (~30-60 min)"
+    echo "  [2] full — compile the entire desktop stack from ports (realistically overnight)"
+    printf "Select [1/2] (default 1): "
+    read choice
+    case "$choice" in
+        2) MODE=full ;;
+        *) MODE=fast ;;
+    esac
+fi
+log "install mode: $MODE"
 
 TARGET_USER="${1:-${SUDO_USER:-}}"
 if [ -z "$TARGET_USER" ]; then
@@ -19,33 +86,28 @@ if [ -z "$TARGET_USER" ]; then
     read TARGET_USER
 fi
 if ! pw usershow "$TARGET_USER" >/dev/null 2>&1; then
-    echo "XXX user '$TARGET_USER' does not exist — create it first (stage 1's job)" >&2
-    exit 1
+    fail "user '$TARGET_USER' does not exist — create it first (stage 1's job)"
 fi
 TARGET_HOME=$(pw usershow "$TARGET_USER" | cut -d: -f9)
 
 NPROC=$(sysctl -n hw.ncpu)
 PORTSDIR=/usr/ports
-LOGDIR=/var/log/installer
-mkdir -p "$LOGDIR"
-FAILED=""
-NOTES=""
 
-log()  { echo ">>> $*"; }
-warn() { echo "!!! $*" >&2; }
-fail() { echo "XXX $*" >&2; exit 1; }
-note() { NOTES="$NOTES
-- $*"; }
+log "target user: $TARGET_USER ($TARGET_HOME), building with ${NPROC} jobs, mode=$MODE"
 
-log "target user: $TARGET_USER ($TARGET_HOME), building with ${NPROC} jobs"
+################################################################################
+# PART A — desktop stack
+################################################################################
 
-# PART A — desktop stack, built from ports
+### A1. bootstrap pkg (always needed, both modes) ----------------------------
 
-### A1. bootstrap pkg — only used to fetch git and build the ports tree -----
-
-log "bootstrapping pkg (only to fetch git)"
+log "bootstrapping pkg"
 env ASSUME_ALWAYS_YES=yes pkg bootstrap -y >/dev/null 2>&1 || true
+pkg update -f || warn "pkg update failed — check network / pkg repo config"
 pkg install -y git >/dev/null
+
+### A2. ports tree (only actually needed for hyprland/lock/idle in fast mode,
+### but cheap to have either way, and required for full mode) ---------------
 
 if [ ! -d "$PORTSDIR/.git" ]; then
     log "cloning ports tree (~1-2GB, first run only)"
@@ -56,8 +118,6 @@ else
     (cd "$PORTSDIR" && git pull --ff-only)
 fi
 
-### A2. make.conf tuning -----------------------------------------------------
-
 MAKE_CONF=/etc/make.conf
 touch "$MAKE_CONF"
 grep -q '^MAKE_JOBS_NUMBER' "$MAKE_CONF" || echo "MAKE_JOBS_NUMBER=${NPROC}"    >> "$MAKE_CONF"
@@ -65,7 +125,7 @@ grep -q '^WRKDIRPREFIX'     "$MAKE_CONF" || echo "WRKDIRPREFIX=/usr/obj/ports" >
 grep -q '^OPTIONS_UNSET'    "$MAKE_CONF" || echo "OPTIONS_UNSET+=DOCS EXAMPLES" >> "$MAKE_CONF"
 export BATCH=yes
 
-### A3. helper: build one port, never let one failure kill the whole run ----
+### A3. helpers ----------------------------------------------------------------
 
 build_port() {
     port="$1"
@@ -74,32 +134,81 @@ build_port() {
     if [ ! -d "$dir" ]; then
         warn "skip $port — not found in ports tree (category may have moved; check freshports.org)"
         FAILED="$FAILED $port(missing)"
-        return
+        return 1
     fi
-    log "building $port"
-    if ! make -C "$dir" install clean BATCH=yes IGNORE_OSVERSION=yes >"$logfile" 2>&1; then
+    log "building $port (ports)"
+    t0=$(date +%s)
+    if make -C "$dir" install clean BATCH=yes IGNORE_OSVERSION=yes >"$logfile" 2>&1; then
+        log "built $port in $(( $(date +%s) - t0 ))s"
+        return 0
+    else
         warn "FAILED: $port — see $logfile"
         FAILED="$FAILED $port"
+        return 1
     fi
 }
 
-### A4. build the stack -------------------------------------------------------
+ensure_pkg() {
+    name="$1"
+    logfile="$LOGDIR/pkg_$(printf '%s' "$name" | tr '/' '_').log"
+    if pkg info -e "$name" >/dev/null 2>&1; then
+        log "ok, already installed: $name"
+        return 0
+    fi
+    log "installing $name (pkg)"
+    t0=$(date +%s)
+    if pkg install -y "$name" >"$logfile" 2>&1; then
+        log "installed $name in $(( $(date +%s) - t0 ))s"
+        return 0
+    else
+        warn "FAILED or not in repo: $name — see $logfile"
+        FAILED="$FAILED $name"
+        return 1
+    fi
+}
+
+# ports where compiling is actually worth it even in fast mode: Hyprland
+# and friends move quickly upstream and build options matter more than
+# build time here.
+ALWAYS_PORT="x11-wm/hyprland x11-wm/hyprlock x11-wm/hypridle"
+
+is_always_port() {
+    for p in $ALWAYS_PORT; do
+        [ "$p" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# unified installer: builds from ports in full mode, or when the port is
+# in ALWAYS_PORT regardless of mode; otherwise installs the equivalent
+# binary package (FreeBSD pkg names match the ports leaf name).
+install_component() {
+    port="$1"
+    pkgname="${port##*/}"
+    if [ "$MODE" = "full" ] || is_always_port "$port"; then
+        build_port "$port"
+    else
+        ensure_pkg "$pkgname"
+    fi
+}
+
+### A4. build/install the stack ------------------------------------------------
 # NOTE: FreeBSD base already gives you clang/llvm/lld/lldb, bmake, OpenZFS,
 # GELI, gpart, the loader, pf, WireGuard, OpenSSH, Capsicum, MAC, BSM audit,
 # mtree, devd, dhclient, wpa_supplicant, and unbound (as local_unbound).
-# None of that needs a port — this list is everything ELSE.
+# None of that needs a port or package — this list is everything ELSE.
 
 log "== toolchain =="
 for p in devel/cmake devel/ninja devel/meson devel/pkgconf \
          lang/python311 lang/rust lang/go; do
-    build_port "$p"
+    install_component "$p"
 done
 
 log "== seat / graphics / wayland core =="
 for p in sysutils/seatd graphics/drm-kmod graphics/mesa-libs graphics/mesa-dri \
          graphics/vulkan-loader graphics/vulkan-tools x11/libinput \
          sysutils/dbus sysutils/polkit; do
-    build_port "$p"
+    install_component "$p"
 done
 
 log "== compositor + desktop shell =="
@@ -107,27 +216,27 @@ for p in x11-wm/hyprland x11-wm/hyprlock x11-wm/hypridle x11/xwayland \
          x11/waybar x11/foot x11/ly x11/wl-clipboard x11/mako x11/wlogout \
          x11/nwg-look x11/py-nwg-displays x11/wofi x11/cliphist \
          graphics/grim x11/slurp graphics/swappy; do
-    build_port "$p"
+    install_component "$p"
 done
 
 log "== audio =="
 for p in multimedia/pipewire audio/wireplumber; do
-    build_port "$p"
+    install_component "$p"
 done
 
 log "== shell / CLI tools =="
 for p in shells/fish editors/neovim sysutils/tmux textproc/ripgrep \
          shells/fzf sysutils/btop ftp/curl ftp/wget net/rsync; do
-    build_port "$p"
+    install_component "$p"
 done
 
 log "== security add-ons =="
 for p in security/sudo security/sshguard net/wireguard-tools; do
-    build_port "$p"
+    install_component "$p"
 done
 
-log "== browser (this one alone can take hours) =="
-build_port www/firefox
+log "== browser =="
+install_component www/firefox
 
 ### A5. services + groups -----------------------------------------------------
 
@@ -225,7 +334,7 @@ misc {
     force_default_wallpaper = 0
 }
 
-bind = $mod, K, exec, $terminal
+bind = $mod, RETURN, exec, $terminal
 bind = $mod, E, exec, $fileManager
 bind = $mod, SPACE, exec, $menu
 bind = $mod, B, exec, firefox
@@ -357,31 +466,9 @@ EOF
 
 chown -R "$TARGET_USER":"$TARGET_USER" "$TARGET_HOME/.config"
 
-# PART B — pf hardening + software stack, via pkg
-
-ensure_pkg() {
-    name="$1"
-    logfile="$LOGDIR/pkg_$(printf '%s' "$name" | tr '/' '_').log"
-    if pkg info -e "$name" >/dev/null 2>&1; then
-        log "ok, already installed: $name"
-        return 0
-    fi
-    log "installing: $name"
-    if pkg install -y "$name" >"$logfile" 2>&1; then
-        log "installed: $name"
-        return 0
-    else
-        warn "FAILED or not in repo: $name — see $logfile"
-        FAILED="$FAILED $name"
-        return 1
-    fi
-}
-
-pkg update -f || warn "pkg update failed — check network / pkg repo config"
-
-### B1. pf hardening -----------------------------------------------------------
-# The one section that ABORTS on failure rather than limping on — a
-# firewall that silently didn't load is worse than a script that stops.
+################################################################################
+# PART B — pf hardening + application stack (always via pkg)
+################################################################################
 
 log "== pf firewall =="
 
@@ -440,15 +527,11 @@ service pflog start 2>/dev/null || true
 
 service sshguard restart 2>/dev/null || service sshguard start 2>/dev/null || warn "sshguard didn't (re)start — pf's baseline rules still apply, but check this"
 
-### B2. Linux binary compatibility --------------------------------------------
-
 log "== linux compat layer =="
 sysrc linux_enable=YES >/dev/null
 kldload linux64 2>/dev/null || true
 ensure_pkg linux-rl9 || ensure_pkg linux_base-c7
 note "Linux compat installed for apps that ship only Linux binaries."
-
-### B3. Bluetooth ----------------------------------------------------------------
 
 log "== bluetooth =="
 sysrc hcsecd_enable=YES >/dev/null
@@ -457,16 +540,13 @@ service hcsecd start 2>/dev/null || true
 service sdpd start 2>/dev/null || true
 note "Bluetooth core (hcsecd/sdpd/hccontrol) is base-system; a USB dongle attaches via ng_ubt automatically. No polished GUI applet exists on FreeBSD — expect CLI tools, not a GNOME-style panel."
 
-### B4. CUPS printing --------------------------------------------------------------
-
 log "== printing =="
 ensure_pkg cups
 ensure_pkg cups-filters
 sysrc cupsd_enable=YES >/dev/null
 service cupsd start 2>/dev/null || true
 
-# don't create the cups group ourselves — the package owns that. we only
-# add the user IF it already exists after install.
+# don't create the cups group ourselves — the package owns that
 if pw groupshow cups >/dev/null 2>&1; then
     pw groupmod cups -m "$TARGET_USER" 2>/dev/null || true
     log "added $TARGET_USER to cups group"
@@ -474,8 +554,6 @@ else
     warn "cups group does not exist after package installation — check the cups package's post-install output"
 fi
 note "CUPS admin UI: http://localhost:631 once cupsd is running."
-
-### B5. software stack ----------------------------------------------------------
 
 log "== creative / media =="
 for p in blender kdenlive mpv pwvucontrol inkscape; do
@@ -514,9 +592,12 @@ ensure_pkg linux-steam-utils || note "linux-steam-utils failed/unavailable — S
 log "== bitwarden =="
 ensure_pkg bitwarden-cli || note "Bitwarden's desktop app isn't packaged for FreeBSD. The CLI (bitwarden-cli) or the Firefox/Chromium browser extension are the practical paths."
 
+################################################################################
 # summary
+################################################################################
 
-log "done."
+ELAPSED=$(( $(date +%s) - SCRIPT_START ))
+log "done in $((ELAPSED / 60))m $((ELAPSED % 60))s (mode=$MODE)"
 if [ -n "$FAILED" ]; then
     warn "the following failed, were skipped, or aren't in the repo:$FAILED"
     warn "port build logs: $LOGDIR/port_*.log — pkg logs: $LOGDIR/pkg_*.log"
@@ -526,6 +607,7 @@ if [ -n "$NOTES" ]; then
     echo "=== things worth knowing ===$NOTES"
 fi
 echo ""
+log "full transcript saved to: $MAINLOG"
 log "next steps:"
 log "  1. double-check kld_list in /etc/rc.conf matches your actual GPU"
 log "  2. reboot — ly will greet you on ttyv0, log in as $TARGET_USER, pick hyprland"
