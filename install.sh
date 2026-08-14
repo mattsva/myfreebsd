@@ -105,20 +105,52 @@ TARGET_HOME=$(pw usershow "$TARGET_USER" | cut -d: -f9)
 
 GPU_DRIVER="${GPU_DRIVER:-${1:-}}"
 [ -n "${1:-}" ] && shift
+
+detect_gpu() {
+    # class=0x03 is the PCI display-controller class; grab that line plus
+    # the vendor/device lines pciconf prints right after it.
+    info=$(pciconf -lv 2>/dev/null | awk '
+        /class=0x03/ { grab=5 }
+        grab>0 { print; grab-- }
+    ')
+    case "$info" in
+        *"Intel"*)                                            echo intel ;;
+        *"NVIDIA"*)                                            echo nvidia ;;
+        *"Advanced Micro Devices"*|*"ATI"*)                    echo amd ;;
+        *"VMware"*|*"QEMU"*|*"Red Hat, Inc."*|*"InnoTek"*|*"VirtualBox"*|*"Bochs"*|*"1234:1111"*) echo vm ;;
+        *)                                                     echo unknown ;;
+    esac
+}
+
 if [ -z "$GPU_DRIVER" ]; then
-    echo "GPU driver to load (checks lspci-equivalent for you isn't reliable on FreeBSD, so this is explicit):"
-    pciconf -lv 2>/dev/null | grep -B3 "class=0x03" | grep -E 'device|vendor' | sed 's/^/    /' || true
-    echo "  [1] intel   -> i915kms"
-    echo "  [2] amd     -> amdgpu"
-    echo "  [3] nvidia  -> proprietary nvidia-driver (NOT drm-kmod)"
-    echo "  [4] none    -> skip, I'll configure this myself"
-    printf "Select [1-4] (default 4): "
-    read gchoice
-    case "$gchoice" in
-        1) GPU_DRIVER=intel ;;
-        2) GPU_DRIVER=amd ;;
-        3) GPU_DRIVER=nvidia ;;
-        *) GPU_DRIVER=none ;;
+    DETECTED="$(detect_gpu)"
+    case "$DETECTED" in
+        intel|amd|nvidia)
+            GPU_DRIVER="$DETECTED"
+            log "auto-detected GPU: $GPU_DRIVER (override with GPU_DRIVER=... or a 3rd argument if this is wrong)"
+            ;;
+        vm)
+            warn "detected a virtual-machine display adapter (QEMU/VirtualBox/VMware/Bochs), not real GPU hardware"
+            warn "drm-kmod doesn't target these — Hyprland will likely need software rendering (llvmpipe) in a VM, expect it to be slow or not start"
+            GPU_DRIVER=none
+            ;;
+        *)
+            warn "could not confidently auto-detect a GPU vendor from pciconf output"
+            echo "GPU driver to load:"
+            pciconf -lv 2>/dev/null | grep -B3 "class=0x03" | sed 's/^/    /' || true
+            echo "  [1] intel   -> i915kms"
+            echo "  [2] amd     -> amdgpu"
+            echo "  [3] nvidia  -> proprietary nvidia-driver (NOT drm-kmod)"
+            echo "  [4] none    -> skip, I'll configure this myself"
+            printf "Select [1-4] (default 4): "
+            read gchoice
+            case "$gchoice" in
+                1) GPU_DRIVER=intel ;;
+                2) GPU_DRIVER=amd ;;
+                3) GPU_DRIVER=nvidia ;;
+                *) GPU_DRIVER=none ;;
+            esac
+            ;;
     esac
 fi
 log "GPU driver selection: $GPU_DRIVER"
