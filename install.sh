@@ -568,6 +568,12 @@ chown -R "$TARGET_USER":"$TARGET_USER" "$TARGET_HOME/.config"
 
 log "== pf firewall =="
 
+# pfctl/route depend on the netlink(4) kernel module since ~2023; it's
+# usually autoloaded, but not reliably in minimal/VM kernels — load it
+# explicitly and persist it, or pfctl fails with "Failed to open netlink"
+sysrc kld_list+="netlink" >/dev/null
+kldload netlink 2>/dev/null || warn "kldload netlink failed — if pfctl errors with 'Failed to open netlink', this is why; check that netlink.ko exists in /boot/kernel"
+
 EXT_IF="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
 if [ -z "$EXT_IF" ]; then
     fail "could not determine the default-route interface — refusing to guess for a firewall config. Candidates: $(ifconfig -l 2>/dev/null). Set it manually and re-run."
