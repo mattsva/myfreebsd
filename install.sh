@@ -64,10 +64,15 @@ note() { NOTES="$NOTES
 log "log transcript: $MAINLOG"
 
 FREEBSD_VERSION="$(freebsd-version -u 2>/dev/null || echo unknown)"
-log "FreeBSD userland: $FREEBSD_VERSION"
+FREEBSD_KERNEL="$(freebsd-version -k 2>/dev/null || echo unknown)"
+log "FreeBSD userland: $FREEBSD_VERSION, kernel: $FREEBSD_KERNEL"
+if [ "$FREEBSD_VERSION" != "$FREEBSD_KERNEL" ]; then
+    warn "kernel/userland version MISMATCH: kernel=$FREEBSD_KERNEL userland=$FREEBSD_VERSION"
+    warn "this alone can break netlink-dependent tools like pfctl (ABI drift between versions) — fix with 'freebsd-update install' + reboot before continuing if pf gives you netlink errors"
+fi
 case "$FREEBSD_VERSION" in
     15.*) : ;;
-    *) warn "this script was written against FreeBSD 15.x, you're on $FREEBSD_VERSION — proceeding, but watch for port/ABI mismatches" ;;
+    *) warn "this script was written against FreeBSD 15.x, userland is $FREEBSD_VERSION — proceeding, but watch for port/ABI mismatches" ;;
 esac
 
 ### 0. mode + primary user + GPU ------------------------------------------
@@ -572,7 +577,13 @@ log "== pf firewall =="
 # usually autoloaded, but not reliably in minimal/VM kernels — load it
 # explicitly and persist it, or pfctl fails with "Failed to open netlink"
 sysrc kld_list+="netlink" >/dev/null
-kldload netlink 2>/dev/null || warn "kldload netlink failed — if pfctl errors with 'Failed to open netlink', this is why; check that netlink.ko exists in /boot/kernel"
+if ! kldload netlink 2>"$LOGDIR/kldload_netlink.log"; then
+    if grep -qi "already loaded\|file exists" "$LOGDIR/kldload_netlink.log"; then
+        log "netlink already loaded, fine"
+    else
+        warn "kldload netlink failed — if pfctl errors with 'Failed to open netlink', check kernel/userland version match first (see above), then check /boot/kernel/netlink.ko exists"
+    fi
+fi
 
 EXT_IF="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
 if [ -z "$EXT_IF" ]; then
