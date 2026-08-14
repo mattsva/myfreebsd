@@ -1,7 +1,8 @@
 #!/bin/sh
 #
 # FreeBSD Hyprland desktop installer — full run
-# Run as: sudo sh install.sh [fast|full] [username]
+# Run as: sudo sh install.sh [fast|medium|full] [username] [gpu]
+#   gpu is one of: intel amd nvidia none  (see GPU section below)
 #
 # Picks up exactly where stage 1 left off (base FreeBSD 15.x, ZFS/GELI,
 # a user created and in wheel/sudo). From there this single script:
@@ -13,21 +14,23 @@
 #   4. installs the rest of the software stack via pkg, checking what's
 #      already there and continuing past anything that fails
 #
-# TWO MODES, chosen interactively or as $1:
-#   fast  pkg (binary packages) for the desktop stack — only Hyprland,
-#         Hyprlock and Hypridle are actually compiled from ports, because
-#         those move fast upstream and build options matter; everything
-#         else (Mesa, Rust, Go, Firefox, Qt-heavy stuff...) is identical
-#         either way and pkg saves hours. Realistically ~30-60 min.
-#   full  compile the ENTIRE desktop stack from ports, as before.
-#         Realistically an overnight build even on fast hardware.
+# THREE MODES, chosen interactively or as $1:
+#   fast    everything via pkg (binary packages), including Hyprland
+#           itself. Fastest possible, no compiling at all. ~10-15 min.
+#   medium  pkg for everything EXCEPT the pieces where compiling from
+#           ports genuinely matters at runtime — Hyprland, Hyprlock,
+#           Hypridle, Waybar, foot, fish, neovim (fast-moving upstream,
+#           build options you'd actually want). Realistically ~1-2h.
+#   full    compile the ENTIRE desktop stack from ports. Realistically
+#           an overnight build even on fast hardware.
 #
 # Part B (the big application list: Blender, LibreOffice, Chromium, ...)
 # always uses pkg regardless of mode — compiling that from ports is not
-# a reasonable trade-off in either mode.
+# a reasonable trade-off in any of the three.
 #
 # Rule enforced throughout:
 #   security component fails (pf)      -> ABORT, fix it before continuing
+#   required bootstrap dep fails       -> ABORT (pkg itself, git)
 #   optional application fails         -> log it, move on
 #
 # Logging: every run gets its own timestamped transcript under
@@ -40,7 +43,7 @@
 set -u
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "Run this as root: sudo sh install.sh [fast|full] [username]" >&2
+    echo "Run this as root: sudo sh install.sh [fast|medium|full] [username] [gpu]" >&2
     exit 1
 fi
 
@@ -60,27 +63,37 @@ note() { NOTES="$NOTES
 
 log "log transcript: $MAINLOG"
 
-### 0. mode + primary user ------------------------------------------------
+FREEBSD_VERSION="$(freebsd-version -u 2>/dev/null || echo unknown)"
+log "FreeBSD userland: $FREEBSD_VERSION"
+case "$FREEBSD_VERSION" in
+    15.*) : ;;
+    *) warn "this script was written against FreeBSD 15.x, you're on $FREEBSD_VERSION — proceeding, but watch for port/ABI mismatches" ;;
+esac
+
+### 0. mode + primary user + GPU ------------------------------------------
 
 MODE=""
 case "${1:-}" in
-    fast|full) MODE="$1"; shift ;;
+    fast|medium|full) MODE="$1"; shift ;;
 esac
 
 if [ -z "$MODE" ]; then
     echo "Choose install mode:"
-    echo "  [1] fast — pkg for the desktop stack, ports only for Hyprland/Hyprlock/Hypridle (~30-60 min)"
-    echo "  [2] full — compile the entire desktop stack from ports (realistically overnight)"
-    printf "Select [1/2] (default 1): "
+    echo "  [1] fast   — everything via pkg, including Hyprland itself (~10-15 min)"
+    echo "  [2] medium — pkg for most things, ports for Hyprland/Hyprlock/Hypridle/Waybar/foot/fish/neovim (~1-2h)"
+    echo "  [3] full   — compile the entire desktop stack from ports (realistically overnight)"
+    printf "Select [1/2/3] (default 1): "
     read choice
     case "$choice" in
-        2) MODE=full ;;
+        2) MODE=medium ;;
+        3) MODE=full ;;
         *) MODE=fast ;;
     esac
 fi
 log "install mode: $MODE"
 
 TARGET_USER="${1:-${SUDO_USER:-}}"
+[ -n "${1:-}" ] && shift
 if [ -z "$TARGET_USER" ]; then
     printf "Primary (desktop) username on this system: "
     read TARGET_USER
@@ -90,32 +103,59 @@ if ! pw usershow "$TARGET_USER" >/dev/null 2>&1; then
 fi
 TARGET_HOME=$(pw usershow "$TARGET_USER" | cut -d: -f9)
 
+GPU_DRIVER="${GPU_DRIVER:-${1:-}}"
+[ -n "${1:-}" ] && shift
+if [ -z "$GPU_DRIVER" ]; then
+    echo "GPU driver to load (checks lspci-equivalent for you isn't reliable on FreeBSD, so this is explicit):"
+    pciconf -lv 2>/dev/null | grep -B3 "class=0x03" | grep -E 'device|vendor' | sed 's/^/    /' || true
+    echo "  [1] intel   -> i915kms"
+    echo "  [2] amd     -> amdgpu"
+    echo "  [3] nvidia  -> proprietary nvidia-driver (NOT drm-kmod)"
+    echo "  [4] none    -> skip, I'll configure this myself"
+    printf "Select [1-4] (default 4): "
+    read gchoice
+    case "$gchoice" in
+        1) GPU_DRIVER=intel ;;
+        2) GPU_DRIVER=amd ;;
+        3) GPU_DRIVER=nvidia ;;
+        *) GPU_DRIVER=none ;;
+    esac
+fi
+log "GPU driver selection: $GPU_DRIVER"
+
 NPROC=$(sysctl -n hw.ncpu)
 PORTSDIR=/usr/ports
 
-log "target user: $TARGET_USER ($TARGET_HOME), building with ${NPROC} jobs, mode=$MODE"
+log "target user: $TARGET_USER ($TARGET_HOME), building with ${NPROC} jobs, mode=$MODE, gpu=$GPU_DRIVER"
 
 ################################################################################
 # PART A — desktop stack
 ################################################################################
 
-### A1. bootstrap pkg (always needed, both modes) ----------------------------
+### A1. bootstrap pkg — required, aborts the whole script if it fails --------
 
 log "bootstrapping pkg"
-env ASSUME_ALWAYS_YES=yes pkg bootstrap -y >/dev/null 2>&1 || true
+if ! command -v pkg >/dev/null 2>&1; then
+    env ASSUME_ALWAYS_YES=yes pkg bootstrap -y || fail "could not bootstrap pkg — nothing else in this script can work without it"
+fi
 pkg update -f || warn "pkg update failed — check network / pkg repo config"
-pkg install -y git >/dev/null
 
-### A2. ports tree (only actually needed for hyprland/lock/idle in fast mode,
-### but cheap to have either way, and required for full mode) ---------------
+if [ "$MODE" = "full" ] || [ "$MODE" = "medium" ]; then
+    pkg install -y git || fail "could not install git — required to fetch the ports tree for mode=$MODE"
 
-if [ ! -d "$PORTSDIR/.git" ]; then
-    log "cloning ports tree (~1-2GB, first run only)"
-    rm -rf "$PORTSDIR"
-    git clone --depth 1 https://git.FreeBSD.org/ports.git "$PORTSDIR"
+    ### A2. ports tree — refuse to touch anything that isn't ours to delete ---
+    if [ -e "$PORTSDIR" ] && [ ! -d "$PORTSDIR/.git" ]; then
+        fail "$PORTSDIR exists but is not a git checkout — refusing to delete it. Move it aside yourself and re-run if you want a fresh clone."
+    fi
+    if [ ! -d "$PORTSDIR/.git" ]; then
+        log "cloning ports tree (~1-2GB, first run only)"
+        git clone --depth 1 https://git.FreeBSD.org/ports.git "$PORTSDIR" || fail "ports tree clone failed"
+    else
+        log "updating existing ports tree"
+        (cd "$PORTSDIR" && git pull --ff-only) || warn "ports tree update failed — continuing with whatever's on disk"
+    fi
 else
-    log "updating existing ports tree"
-    (cd "$PORTSDIR" && git pull --ff-only)
+    log "mode=fast — skipping ports tree entirely, pkg only"
 fi
 
 MAKE_CONF=/etc/make.conf
@@ -138,7 +178,7 @@ build_port() {
     fi
     log "building $port (ports)"
     t0=$(date +%s)
-    if make -C "$dir" install clean BATCH=yes IGNORE_OSVERSION=yes >"$logfile" 2>&1; then
+    if make -C "$dir" install clean BATCH=yes >"$logfile" 2>&1; then
         log "built $port in $(( $(date +%s) - t0 ))s"
         return 0
     else
@@ -167,29 +207,37 @@ ensure_pkg() {
     fi
 }
 
-# ports where compiling is actually worth it even in fast mode: Hyprland
-# and friends move quickly upstream and build options matter more than
-# build time here.
-ALWAYS_PORT="x11-wm/hyprland x11-wm/hyprlock x11-wm/hypridle"
+# ports where compiling is actually worth it in medium mode: fast-moving
+# upstream + build options that matter at runtime. Not used in fast mode
+# (everything is pkg there) or full mode (everything is ports there).
+MEDIUM_PORT="x11-wm/hyprland x11-wm/hyprlock x11-wm/hypridle x11/waybar x11/foot shells/fish editors/neovim"
 
-is_always_port() {
-    for p in $ALWAYS_PORT; do
+is_medium_port() {
+    for p in $MEDIUM_PORT; do
         [ "$p" = "$1" ] && return 0
     done
     return 1
 }
 
-# unified installer: builds from ports in full mode, or when the port is
-# in ALWAYS_PORT regardless of mode; otherwise installs the equivalent
-# binary package (FreeBSD pkg names match the ports leaf name).
+# unified installer, three-tier:
+#   fast   -> always pkg
+#   medium -> ports for MEDIUM_PORT list, pkg for everything else
+#   full   -> always ports
+# (FreeBSD pkg names match the ports leaf name, e.g. x11/foot -> foot)
 install_component() {
     port="$1"
     pkgname="${port##*/}"
-    if [ "$MODE" = "full" ] || is_always_port "$port"; then
-        build_port "$port"
-    else
-        ensure_pkg "$pkgname"
-    fi
+    case "$MODE" in
+        full)
+            build_port "$port"
+            ;;
+        medium)
+            if is_medium_port "$port"; then build_port "$port"; else ensure_pkg "$pkgname"; fi
+            ;;
+        *)
+            ensure_pkg "$pkgname"
+            ;;
+    esac
 }
 
 ### A4. build/install the stack ------------------------------------------------
@@ -256,9 +304,25 @@ log "adding $TARGET_USER to video/seatd groups"
 pw groupmod video -m "$TARGET_USER" 2>/dev/null || true
 pw groupmod seatd -m "$TARGET_USER" 2>/dev/null || true
 
-log "loading DRM KMS module — EDIT THIS for your actual GPU (i915kms/amdgpu/radeonkms)"
-sysrc kld_list+="i915kms" >/dev/null
-kldload i915kms 2>/dev/null || warn "kldload i915kms failed — load the right module for your GPU by hand"
+log "GPU driver: $GPU_DRIVER"
+case "$GPU_DRIVER" in
+    intel)
+        sysrc kld_list+="i915kms" >/dev/null
+        kldload i915kms 2>/dev/null || warn "kldload i915kms failed"
+        ;;
+    amd)
+        sysrc kld_list+="amdgpu" >/dev/null
+        kldload amdgpu 2>/dev/null || warn "kldload amdgpu failed"
+        ;;
+    nvidia)
+        ensure_pkg nvidia-driver
+        sysrc kld_list+="nvidia-modeset" >/dev/null
+        note "nvidia-driver installed — this is the proprietary driver, NOT drm-kmod. Reboot required before it's active."
+        ;;
+    none|*)
+        warn "no GPU driver selected — configure graphics/drm-kmod (or nvidia-driver) manually before expecting Hyprland to start"
+        ;;
+esac
 
 ### A6. ly as the login manager on ttyv0 --------------------------------------
 
@@ -525,13 +589,28 @@ sysrc pflog_logfile="/var/log/pflog" >/dev/null
 service pf reload 2>/dev/null || service pf start 2>/dev/null || fail "pf.conf checked out OK but the pf service still won't start — check 'service pf start' manually"
 service pflog start 2>/dev/null || true
 
+if ! pfctl -sr >/dev/null 2>&1; then
+    fail "pf service reports started but no active ruleset was detected — treating this as pf being effectively off, aborting"
+fi
+log "pf confirmed active with a loaded ruleset"
+
 service sshguard restart 2>/dev/null || service sshguard start 2>/dev/null || warn "sshguard didn't (re)start — pf's baseline rules still apply, but check this"
 
-log "== linux compat layer =="
-sysrc linux_enable=YES >/dev/null
-kldload linux64 2>/dev/null || true
-ensure_pkg linux-rl9 || ensure_pkg linux_base-c7
-note "Linux compat installed for apps that ship only Linux binaries."
+log "== linux compat layer (optional) =="
+WITH_LINUX_COMPAT="${WITH_LINUX_COMPAT:-}"
+if [ -z "$WITH_LINUX_COMPAT" ]; then
+    printf "Install Linux compatibility layer? Needed for Steam/some binary-only apps [y/N]: "
+    read ans
+    case "$ans" in y|Y|yes) WITH_LINUX_COMPAT=yes ;; *) WITH_LINUX_COMPAT=no ;; esac
+fi
+if [ "$WITH_LINUX_COMPAT" = "yes" ]; then
+    sysrc linux_enable=YES >/dev/null
+    kldload linux64 2>/dev/null || true
+    ensure_pkg linux-rl9 || ensure_pkg linux_base-c7
+    note "Linux compat installed for apps that ship only Linux binaries."
+else
+    log "skipping Linux compat layer (WITH_LINUX_COMPAT=no)"
+fi
 
 log "== bluetooth =="
 sysrc hcsecd_enable=YES >/dev/null
@@ -579,15 +658,41 @@ for p in thunar thunar-volman tumbler gvfs; do
 done
 
 log "== dev / security tools =="
-for p in wine-devel qemu tree atuin git openjdk21; do
+for p in qemu tree atuin git openjdk21; do
     ensure_pkg "$p"
 done
 ensure_pkg vscodium || note "VSCodium isn't reliably packaged for FreeBSD. neovim (Part A) or editors/lapce (native, lightweight) are the realistic editor options."
 note "Ghidra and Burp Suite have no FreeBSD packages, but both are plain Java apps — openjdk21 is installed above, just run: java -jar burpsuite.jar / ./ghidraRun after downloading the release."
 
-log "== gaming =="
+WITH_WINE="${WITH_WINE:-}"
+if [ -z "$WITH_WINE" ]; then
+    printf "Install Wine (run some Windows apps natively, no Linux compat needed)? [y/N]: "
+    read ans
+    case "$ans" in y|Y|yes) WITH_WINE=yes ;; *) WITH_WINE=no ;; esac
+fi
+if [ "$WITH_WINE" = "yes" ]; then
+    ensure_pkg wine-devel
+else
+    log "skipping Wine (WITH_WINE=no)"
+fi
+
+log "== gaming (optional) =="
 ensure_pkg prismlauncher || note "Prism Launcher may not be in the repo for this release — check 'pkg search prismlauncher' manually."
-ensure_pkg linux-steam-utils || note "linux-steam-utils failed/unavailable — Steam uses the Linuxulator and is hardware- and game-dependent either way. Treat it as an optional compatibility component to test, not something to rely on."
+
+WITH_STEAM="${WITH_STEAM:-}"
+if [ -z "$WITH_STEAM" ]; then
+    printf "Try Steam via linux-steam-utils? Hardware/game-dependent, needs Linux compat [y/N]: "
+    read ans
+    case "$ans" in y|Y|yes) WITH_STEAM=yes ;; *) WITH_STEAM=no ;; esac
+fi
+if [ "$WITH_STEAM" = "yes" ]; then
+    if [ "$WITH_LINUX_COMPAT" != "yes" ]; then
+        warn "Steam requested but Linux compat layer wasn't installed earlier — linux-steam-utils will likely be useless without it"
+    fi
+    ensure_pkg linux-steam-utils || note "linux-steam-utils failed/unavailable — Steam is hardware- and game-dependent either way, treat it as an experiment, not something to rely on."
+else
+    log "skipping Steam (WITH_STEAM=no)"
+fi
 
 log "== bitwarden =="
 ensure_pkg bitwarden-cli || note "Bitwarden's desktop app isn't packaged for FreeBSD. The CLI (bitwarden-cli) or the Firefox/Chromium browser extension are the practical paths."
