@@ -297,7 +297,8 @@ for p in sysutils/seatd graphics/drm-kmod graphics/mesa-libs graphics/mesa-dri \
 done
 
 log "== compositor + desktop shell =="
-for p in x11-wm/hyprland x11-wm/hyprlock x11-wm/hypridle x11/xwayland \
+for p in x11-wm/hyprland x11-wm/hyprlock x11-wm/hypridle x11-wm/hyprpaper \
+         x11-wm/hyprpicker x11/xwayland \
          x11/waybar x11/foot x11/ly x11/wl-clipboard x11/mako x11/wlogout \
          x11/nwg-look x11/py-nwg-displays x11/wofi x11/cliphist \
          graphics/grim x11/slurp graphics/swappy; do
@@ -387,6 +388,8 @@ monitor = , preferred, auto, 1
 
 exec-once = waybar
 exec-once = mako
+exec-once = hyprpaper
+exec-once = /usr/local/libexec/polkit-gnome-authentication-agent-1
 exec-once = wl-paste --type text --watch cliphist store
 exec-once = wl-paste --type image --watch cliphist store
 exec-once = hypridle
@@ -436,16 +439,22 @@ misc {
 }
 
 bind = $mod, RETURN, exec, $terminal
+bind = $mod, K, exec, $terminal
 bind = $mod, E, exec, $fileManager
 bind = $mod, SPACE, exec, $menu
 bind = $mod, B, exec, firefox
 bind = $mod, Q, killactive,
 bind = $mod, F, fullscreen, 0
-bind = $mod, V, togglefloating,
-bind = $mod, P, pseudo,
+bind = $mod, T, togglefloating,
+bind = $mod, U, pseudo,
 bind = $mod, G, pin,
 bind = $mod, L, exec, hyprlock
 bind = $mod, X, exec, wlogout
+bind = $mod, W, exec, waypaper
+bind = $mod, S, exec, nwg-look
+bind = $mod, N, exec, networkmgr
+bind = $mod, A, exec, pwvucontrol
+bind = $mod, C, exec, hyprpicker -a
 
 bind = $mod, left,  movefocus, l
 bind = $mod, right, movefocus, r
@@ -492,8 +501,9 @@ bindm = $mod, mouse:273, resizewindow
 
 bind = , Print, exec, grim -g "$(slurp)" - | wl-copy
 bind = SHIFT, Print, exec, grim - | wl-copy
+bind = $mod, P, exec, grim -g "$(slurp)" - | wl-copy
 
-bind = $mod, PERIOD, exec, cliphist list | wofi --dmenu | cliphist decode | wl-copy
+bind = $mod, V, exec, cliphist list | wofi --dmenu | cliphist decode | wl-copy
 
 bindel = , XF86AudioRaiseVolume,  exec, wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+
 bindel = , XF86AudioLowerVolume,  exec, wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
@@ -529,8 +539,10 @@ cat > "$CONF/waybar/config.jsonc" <<'EOF'
 }
 EOF
 
-log "writing waybar style (square, borderless)"
+log "writing waybar style (square, borderless, wallust-themed)"
 cat > "$CONF/waybar/style.css" <<'EOF'
+@import "colors.css";
+
 * {
     border: none;
     border-radius: 0;
@@ -538,38 +550,133 @@ cat > "$CONF/waybar/style.css" <<'EOF'
     font-size: 13px;
 }
 window#waybar {
-    background: #101010;
-    color: #e0e0e0;
+    background: @background;
+    color: @foreground;
 }
 #workspaces button {
     padding: 0 8px;
     background: transparent;
-    color: #808080;
+    color: @color8;
 }
 #workspaces button.active {
-    background: #202020;
-    color: #ffffff;
+    background: @color0;
+    color: @foreground;
 }
 #clock, #pulseaudio, #network, #battery, #tray {
     padding: 0 10px;
 }
 EOF
 
-log "writing foot config"
+# fallback colors.css so waybar has something to import before wallust
+# ever runs the first time (SUPER+W / waypaper regenerates this)
+cat > "$CONF/waybar/colors.css" <<'EOF'
+@define-color background #101010;
+@define-color foreground #e0e0e0;
+@define-color color0 #202020;
+@define-color color8 #808080;
+EOF
+
+log "writing foot config (wallust-themed)"
 cat > "$CONF/foot/foot.ini" <<'EOF'
 [main]
 font=monospace:size=11
 pad=0x0
+include=~/.config/foot/colors.ini
+EOF
 
+# fallback colors.ini until wallust generates a real one
+cat > "$CONF/foot/colors.ini" <<'EOF'
 [colors]
+background=101010
+foreground=e0e0e0
 alpha=1.0
 EOF
 
 chown -R "$TARGET_USER":"$TARGET_USER" "$TARGET_HOME/.config"
 
+log "writing wallust config + templates"
+mkdir -p "$CONF/wallust/templates" "$CONF/waypaper" "$CONF/hypr/scripts"
+
+cat > "$CONF/wallust/wallust.toml" <<'EOF'
+[templates]
+waybar = { template = "waybar-colors.css", target = "~/.config/waybar/colors.css" }
+foot   = { template = "foot-colors.ini",   target = "~/.config/foot/colors.ini" }
+EOF
+
+cat > "$CONF/wallust/templates/waybar-colors.css" <<'EOF'
+@define-color background {{background}};
+@define-color foreground {{foreground}};
+@define-color color0 {{color0}};
+@define-color color1 {{color1}};
+@define-color color2 {{color2}};
+@define-color color3 {{color3}};
+@define-color color4 {{color4}};
+@define-color color5 {{color5}};
+@define-color color6 {{color6}};
+@define-color color7 {{color7}};
+@define-color color8 {{color8}};
+EOF
+
+cat > "$CONF/wallust/templates/foot-colors.ini" <<'EOF'
+[colors]
+background={{background.strip}}
+foreground={{foreground.strip}}
+regular0={{color0.strip}}
+regular1={{color1.strip}}
+regular2={{color2.strip}}
+regular3={{color3.strip}}
+regular4={{color4.strip}}
+regular5={{color5.strip}}
+regular6={{color6.strip}}
+regular7={{color7.strip}}
+alpha=1.0
+EOF
+
+cat > "$CONF/hypr/scripts/apply-theme.sh" <<'EOF'
+#!/bin/sh
+# Regenerates waybar/foot colors from the current wallpaper via wallust.
+# Called automatically by waypaper's post_command after picking a wallpaper,
+# or run it yourself any time: ~/.config/hypr/scripts/apply-theme.sh <image>
+WALL="${1:-$(hyprctl hyprpaper listloaded 2>/dev/null | tail -1)}"
+[ -z "$WALL" ] && exit 0
+command -v wallust >/dev/null 2>&1 || exit 0
+wallust run "$WALL" >/tmp/wallust.log 2>&1
+pkill -SIGUSR2 waybar 2>/dev/null || true
+EOF
+chmod +x "$CONF/hypr/scripts/apply-theme.sh"
+
+cat > "$CONF/waypaper/config.ini" <<EOF
+[Settings]
+folder = $TARGET_HOME/Pictures/Wallpapers
+backend = hyprpaper
+post_command = $TARGET_HOME/.config/hypr/scripts/apply-theme.sh
+EOF
+
+mkdir -p "$TARGET_HOME/Pictures/Wallpapers"
+chown -R "$TARGET_USER":"$TARGET_USER" "$TARGET_HOME/.config" "$TARGET_HOME/Pictures"
+
 ################################################################################
 # PART B — pf hardening + application stack (always via pkg)
 ################################################################################
+
+log "== desktop polish (fonts, portals, wallpaper, archive/pdf) =="
+for p in nerd-fonts noto qt6-qtimageformats; do
+    ensure_pkg "$p"
+done
+ensure_pkg polkit-gnome || note "polkit-gnome unavailable — try lxqt-policykit instead, some actions (printer setup, blueman prompts) will silently fail without a running polkit agent."
+for p in xdg-desktop-portal xdg-desktop-portal-wlr xdg-user-dirs; do
+    ensure_pkg "$p"
+done
+ensure_pkg waypaper || note "waypaper (SUPER+W) unavailable — hyprpaper itself still runs, set a wallpaper manually with: hyprctl hyprpaper wallpaper \",/path/to/image\""
+ensure_pkg wallust || note "wallust unavailable — wallpaper-based theming (colors.css/colors.ini) won't auto-generate, edit waybar/foot colors by hand instead."
+ensure_pkg networkmgr || note "networkmgr (SUPER+N) unavailable — fall back to CLI: 'service netif restart', wpa_supplicant.conf, or ifconfig by hand."
+for p in unzip p7zip xarchiver thunar-archive-plugin; do
+    ensure_pkg "$p"
+done
+for p in zathura zathura-pdf-poppler imv; do
+    ensure_pkg "$p"
+done
+note "PipeWire ships its own PulseAudio-compatible server — after reboot, run 'pactl info' to confirm apps expecting PulseAudio (Chromium, Firefox) actually see it; if not, check that pipewire-pulse is running alongside pipewire/wireplumber."
 
 log "== pf firewall =="
 
@@ -581,7 +688,7 @@ if ! kldload netlink 2>"$LOGDIR/kldload_netlink.log"; then
     if grep -qi "already loaded\|file exists" "$LOGDIR/kldload_netlink.log"; then
         log "netlink already loaded, fine"
     else
-        warn "kldload netlink failed — if pfctl errors with 'Failed to open netlink', check kernel/userland version match first (see above), then check /boot/kernel/netlink.ko exists"
+        warn "kldload netlink failed — check kernel/userland version match (see above), then check /boot/kernel/netlink.ko exists"
     fi
 fi
 
@@ -592,12 +699,12 @@ fi
 log "using external interface: $EXT_IF"
 
 PF_CONF=/etc/pf.conf
-if [ -f "$PF_CONF" ]; then
-    cp "$PF_CONF" "${PF_CONF}.bak.$(date +%s)"
-    log "existing pf.conf backed up"
-fi
 
-cat > "$PF_CONF" <<EOF
+write_pf_conf() {
+    if [ -f "$PF_CONF" ]; then
+        cp "$PF_CONF" "${PF_CONF}.bak.$(date +%s)"
+    fi
+    cat > "$PF_CONF" <<EOF
 # pf.conf — generated by install.sh
 # default-deny, stateful, ssh brute-force throttling via table + sshguard
 
@@ -626,24 +733,137 @@ pass in quick on \$ext_if inet6 proto icmp6 icmp6-type echoreq keep state
 # WireGuard, if you're running it — uncomment and set your port
 # pass in quick on \$ext_if proto udp to port 51820 keep state
 EOF
+}
 
-if ! pfctl -nf "$PF_CONF" >"$LOGDIR/pfctl_check.log" 2>&1; then
-    fail "pf.conf failed syntax check — see $LOGDIR/pfctl_check.log — pf NOT enabled, fix the ruleset before re-running (hard stop, not a warning)"
+# returns 0 on a confirmed-working pf, 1 otherwise — never calls fail()
+# itself, so the caller can decide what to do next
+pf_attempt() {
+    write_pf_conf
+    if ! pfctl -nf "$PF_CONF" >"$LOGDIR/pfctl_check.log" 2>&1; then
+        warn "pf.conf failed syntax check — see $LOGDIR/pfctl_check.log"
+        return 1
+    fi
+    log "pf.conf syntax OK"
+    sysrc pf_enable=YES        >/dev/null
+    sysrc pf_rules="$PF_CONF"  >/dev/null
+    sysrc pflog_enable=YES     >/dev/null
+    sysrc pflog_logfile="/var/log/pflog" >/dev/null
+    if ! { service pf reload 2>>"$LOGDIR/pfctl_check.log" || service pf start 2>>"$LOGDIR/pfctl_check.log"; }; then
+        warn "pf service failed to start — see $LOGDIR/pfctl_check.log"
+        return 1
+    fi
+    service pflog start 2>/dev/null || true
+    if ! pfctl -sr >/dev/null 2>>"$LOGDIR/pfctl_check.log"; then
+        warn "pf started but no active ruleset detected — see $LOGDIR/pfctl_check.log"
+        return 1
+    fi
+    log "pf confirmed active with a loaded ruleset"
+    return 0
+}
+
+# ipfw fallback: equivalent default-deny policy, doesn't touch netlink at
+# all, and points sshguard at its ipfw backend instead of pf's tables
+setup_ipfw_fallback() {
+    log "configuring ipfw as fallback firewall"
+    cat > /etc/ipfw.rules <<EOF
+#!/bin/sh
+ipfw -q flush
+oif="$EXT_IF"
+ipfw -q add 100 check-state
+ipfw -q add 200 allow all from any to any via lo0
+ipfw -q add 210 deny all from any to 127.0.0.0/8
+ipfw -q add 220 deny log all from any to any frag
+ipfw -q add 300 allow tcp from any to any established
+ipfw -q add 400 allow all from any to any out via \$oif keep-state
+ipfw -q add 500 allow icmp from any to any icmptypes 0,8,11
+ipfw -q add 600 allow tcp from any to any 22 in via \$oif setup limit src-addr 15
+ipfw -q add 65000 deny log all from any to any
+EOF
+    chmod 755 /etc/ipfw.rules
+    sysrc firewall_enable=YES        >/dev/null
+    sysrc firewall_script=/etc/ipfw.rules >/dev/null
+    sysrc firewall_logging=YES       >/dev/null
+    if ! service ipfw start >"$LOGDIR/ipfw_start.log" 2>&1; then
+        warn "ipfw failed to start too — see $LOGDIR/ipfw_start.log"
+        return 1
+    fi
+    # sshguard ships pf/ipfw backends — point it at ipfw instead of pf's tables
+    SSHG_CONF=/usr/local/etc/sshguard.conf
+    if [ -f "$SSHG_CONF" ]; then
+        cp "$SSHG_CONF" "${SSHG_CONF}.bak.$(date +%s)"
+        if grep -q '^BACKEND=' "$SSHG_CONF"; then
+            sed -i '' 's#^BACKEND=.*#BACKEND="/usr/local/libexec/sshguard/ipfw.sh"#' "$SSHG_CONF"
+        else
+            echo 'BACKEND="/usr/local/libexec/sshguard/ipfw.sh"' >> "$SSHG_CONF"
+        fi
+    fi
+    service sshguard restart 2>/dev/null || service sshguard start 2>/dev/null || true
+    note "Firewall is ipfw, not pf — pf.conf was written but never activated. sshguard is pointed at the ipfw backend."
+    return 0
+}
+
+PF_OK=0
+if pf_attempt; then
+    PF_OK=1
 fi
-log "pf.conf syntax OK"
-sysrc pf_enable=YES        >/dev/null
-sysrc pf_rules="$PF_CONF"  >/dev/null
-sysrc pflog_enable=YES     >/dev/null
-sysrc pflog_logfile="/var/log/pflog" >/dev/null
-service pf reload 2>/dev/null || service pf start 2>/dev/null || fail "pf.conf checked out OK but the pf service still won't start — check 'service pf start' manually"
-service pflog start 2>/dev/null || true
 
-if ! pfctl -sr >/dev/null 2>&1; then
-    fail "pf service reports started but no active ruleset was detected — treating this as pf being effectively off, aborting"
+if [ "$PF_OK" -ne 1 ]; then
+    FW_FALLBACK="${FW_FALLBACK:-}"
+    if [ -z "$FW_FALLBACK" ]; then
+        echo ""
+        echo "pf did not come up. Diagnostics are in $LOGDIR/pfctl_check.log. Choose how to proceed:"
+        echo "  [1] retry pf now (in case it was transient)"
+        echo "  [2] fall back to ipfw with an equivalent default-deny ruleset"
+        echo "  [3] continue WITHOUT any firewall (test/VM only, NOT recommended)"
+        echo "  [4] abort here and fix pf manually"
+        printf "Select [1-4] (default 4): "
+        read fwchoice
+        case "$fwchoice" in
+            1) FW_FALLBACK=retry ;;
+            2) FW_FALLBACK=ipfw ;;
+            3) FW_FALLBACK=none ;;
+            *) FW_FALLBACK=abort ;;
+        esac
+    fi
+
+    if [ "$FW_FALLBACK" = "retry" ]; then
+        if pf_attempt; then
+            PF_OK=1
+        else
+            warn "retry failed too"
+            FW_FALLBACK=abort
+        fi
+    fi
+
+    if [ "$PF_OK" -ne 1 ]; then
+        case "$FW_FALLBACK" in
+            ipfw)
+                if setup_ipfw_fallback; then
+                    log "ipfw fallback active"
+                else
+                    fail "ipfw fallback also failed — see $LOGDIR/ipfw_start.log — refusing to continue with no firewall at all"
+                fi
+                ;;
+            none)
+                printf "Type exactly: yes I understand   to continue with NO firewall: "
+                read confirm
+                if [ "$confirm" = "yes I understand" ]; then
+                    warn "continuing WITHOUT any firewall — this host is unprotected at the network layer"
+                    note "No firewall active (pf failed, ipfw not chosen) — fix this before exposing the machine to any network. Diagnostics: $LOGDIR/pfctl_check.log"
+                else
+                    fail "confirmation not given — aborting rather than silently running unprotected"
+                fi
+                ;;
+            *)
+                fail "pf not working and no fallback chosen — see $LOGDIR/pfctl_check.log, or re-run with FW_FALLBACK=ipfw / FW_FALLBACK=none to skip this prompt"
+                ;;
+        esac
+    fi
 fi
-log "pf confirmed active with a loaded ruleset"
 
-service sshguard restart 2>/dev/null || service sshguard start 2>/dev/null || warn "sshguard didn't (re)start — pf's baseline rules still apply, but check this"
+if [ "$PF_OK" -eq 1 ]; then
+    service sshguard restart 2>/dev/null || service sshguard start 2>/dev/null || warn "sshguard didn't (re)start — pf's baseline rules still apply, but check this"
+fi
 
 log "== linux compat layer (optional) =="
 WITH_LINUX_COMPAT="${WITH_LINUX_COMPAT:-}"
