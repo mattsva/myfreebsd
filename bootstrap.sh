@@ -82,10 +82,14 @@ printf "Root password (visible, live shell only): "
 read ROOTPASS
 
 printf "GELI disk-encryption passphrase: "
-read -s GELIPASS
+stty -echo
+read GELIPASS
+stty echo
 echo ""
 printf "confirm passphrase: "
-read -s GELIPASS2
+stty -echo
+read GELIPASS2
+stty echo
 echo ""
 if [ "$GELIPASS" != "$GELIPASS2" ]; then
     echo "passphrases didn't match — aborting." >&2
